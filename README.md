@@ -60,6 +60,28 @@ pz -x <archive.tar.gz> <destination-folder>
 - Shows progress bar with extraction speed
 - Includes path traversal protection for security
 
+### Windows Context Menu Integration
+
+Add "Compress with pz" to Windows Explorer right-click menu:
+
+```powershell
+# Install context menu (requires administrator)
+pz --context install
+
+# Check installation status
+pz --context status
+
+# Uninstall context menu
+pz --context uninstall
+```
+
+Once installed, you can right-click any folder or file and choose:
+- **Compress to ZIP** - Creates a .zip archive
+- **Compress to tar.gz** - Creates a .tar.gz archive
+- **Extract here** - Extracts archives to the current location
+
+The tool automatically requests administrator privileges if needed.
+
 ### Progress Output
 
 **Creating Archive:**
@@ -84,7 +106,9 @@ To add the tool to the system `env` you can copy the pz.exe from `bin\pz.exe` to
 Then `start` type `env` click `Enviroment Variables` select `Path > Edit > New`.
 Then paste `C:\Program files\pz\`.
 
-Open `cmd / powershell` type `pz` and you should get `Usage: pz <folder>`.
+Open `cmd / powershell` type `pz` and you should get the usage information.
+
+**Recommended:** After adding to PATH, run `pz --context install` to enable right-click context menu integration.
 
 ## Development
 

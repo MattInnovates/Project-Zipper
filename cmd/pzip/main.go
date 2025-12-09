@@ -5,17 +5,20 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/0xRepo-Source/Project-Zipper/internal/zipper"
+	"golang.org/x/sys/windows/registry"
 )
 
 func main() {
 	extractFlag := flag.Bool("x", false, "extract mode: extract archive to destination")
 	formatFlag := flag.String("f", "zip", "archive format: zip or gz (tar.gz)")
+	contextFlag := flag.String("context", "", "install/uninstall Windows context menu: install, uninstall, or status")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [options] <source> [destination]\n", filepath.Base(os.Args[0]))
 		fmt.Fprintln(flag.CommandLine.Output(), "\nCreate or extract archives.")
@@ -25,9 +28,19 @@ func main() {
 		fmt.Fprintln(flag.CommandLine.Output(), "\nEXTRACT MODE:")
 		fmt.Fprintln(flag.CommandLine.Output(), "  pz -x <archive.zip>   Extract archive to current directory")
 		fmt.Fprintln(flag.CommandLine.Output(), "  pz -x <archive.tar.gz> <dest>  Extract archive to destination folder")
+		fmt.Fprintln(flag.CommandLine.Output(), "\nCONTEXT MENU (Windows):")
+		fmt.Fprintln(flag.CommandLine.Output(), "  pz --context install    Add 'Compress with pz' to Windows context menu")
+		fmt.Fprintln(flag.CommandLine.Output(), "  pz --context uninstall  Remove from Windows context menu")
+		fmt.Fprintln(flag.CommandLine.Output(), "  pz --context status     Check installation status")
 	}
 
 	flag.Parse()
+
+	// Handle context menu operations
+	if *contextFlag != "" {
+		handleContextMenu(*contextFlag)
+		return
+	}
 
 	if flag.NArg() < 1 {
 		flag.Usage()
@@ -369,4 +382,199 @@ func formatBytes(n int64) string {
 	}
 	value := float64(n) / div
 	return fmt.Sprintf("%.1f %s", value, suffixes[exp])
+}
+
+// handleContextMenu manages Windows context menu integration
+func handleContextMenu(action string) {
+	if runtime.GOOS != "windows" {
+		fmt.Fprintln(os.Stderr, "Context menu integration is only available on Windows")
+		os.Exit(1)
+	}
+
+	switch strings.ToLower(action) {
+	case "install":
+		if err := installContextMenu(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to install context menu: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("✓ Context menu installed successfully!")
+		fmt.Println("Right-click any folder or file and look for 'Compress with pz' options")
+	case "uninstall":
+		if err := uninstallContextMenu(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to uninstall context menu: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("✓ Context menu uninstalled successfully!")
+	case "status":
+		checkContextMenuStatus()
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown action: %s (use install, uninstall, or status)\n", action)
+		os.Exit(1)
+	}
+}
+
+// installContextMenu adds registry entries for Windows Explorer context menu
+func installContextMenu() error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("cannot get executable path: %w", err)
+	}
+
+	// Check if running as administrator
+	if !isAdmin() {
+		fmt.Println("⚠ Administrator privileges required for context menu installation")
+		fmt.Println("Attempting to restart with administrator privileges...")
+		return runAsAdmin("--context", "install")
+	}
+
+	// Directory background context menu (right-click in folder)
+	keys := []struct {
+		path    string
+		command string
+		name    string
+	}{
+		{
+			path:    `Directory\\shell\\pz_zip`,
+			command: fmt.Sprintf(`"%s" "%%V"`, exePath),
+			name:    "Compress to ZIP",
+		},
+		{
+			path:    `Directory\\shell\\pz_targz`,
+			command: fmt.Sprintf(`"%s" -f gz "%%V"`, exePath),
+			name:    "Compress to tar.gz",
+		},
+		{
+			path:    `Directory\\Background\\shell\\pz_zip`,
+			command: fmt.Sprintf(`"%s" "%%V"`, exePath),
+			name:    "Compress folder to ZIP",
+		},
+		{
+			path:    `Directory\\Background\\shell\\pz_targz`,
+			command: fmt.Sprintf(`"%s" -f gz "%%V"`, exePath),
+			name:    "Compress folder to tar.gz",
+		},
+		{
+			path:    `*\\shell\\pz_zip`,
+			command: fmt.Sprintf(`"%s" "%%1"`, exePath),
+			name:    "Compress to ZIP",
+		},
+		{
+			path:    `*\\shell\\pz_extract`,
+			command: fmt.Sprintf(`"%s" -x "%%1"`, exePath),
+			name:    "Extract here",
+		},
+	}
+
+	for _, k := range keys {
+		key, _, err := registry.CreateKey(registry.CLASSES_ROOT, k.path, registry.SET_VALUE)
+		if err != nil {
+			return fmt.Errorf("failed to create key %s: %w", k.path, err)
+		}
+		if err := key.SetStringValue("", k.name); err != nil {
+			key.Close()
+			return fmt.Errorf("failed to set name for %s: %w", k.path, err)
+		}
+		key.Close()
+
+		// Set icon
+		iconKey, _, err := registry.CreateKey(registry.CLASSES_ROOT, k.path, registry.SET_VALUE)
+		if err == nil {
+			iconKey.SetStringValue("Icon", exePath+",0")
+			iconKey.Close()
+		}
+
+		// Create command subkey
+		cmdKey, _, err := registry.CreateKey(registry.CLASSES_ROOT, k.path+`\\command`, registry.SET_VALUE)
+		if err != nil {
+			return fmt.Errorf("failed to create command key for %s: %w", k.path, err)
+		}
+		if err := cmdKey.SetStringValue("", k.command); err != nil {
+			cmdKey.Close()
+			return fmt.Errorf("failed to set command for %s: %w", k.path, err)
+		}
+		cmdKey.Close()
+	}
+
+	return nil
+}
+
+// uninstallContextMenu removes registry entries
+func uninstallContextMenu() error {
+	// Check if running as administrator
+	if !isAdmin() {
+		fmt.Println("⚠ Administrator privileges required for context menu uninstallation")
+		fmt.Println("Attempting to restart with administrator privileges...")
+		return runAsAdmin("--context", "uninstall")
+	}
+
+	keys := []string{
+		`Directory\\shell\\pz_zip`,
+		`Directory\\shell\\pz_targz`,
+		`Directory\\Background\\shell\\pz_zip`,
+		`Directory\\Background\\shell\\pz_targz`,
+		`*\\shell\\pz_zip`,
+		`*\\shell\\pz_extract`,
+	}
+
+	var errors []string
+	for _, k := range keys {
+		if err := registry.DeleteKey(registry.CLASSES_ROOT, k); err != nil {
+			if err != registry.ErrNotExist {
+				errors = append(errors, fmt.Sprintf("%s: %v", k, err))
+			}
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("some keys could not be removed:\\n%s", strings.Join(errors, "\\n"))
+	}
+
+	return nil
+}
+
+// checkContextMenuStatus checks if context menu is installed
+func checkContextMenuStatus() {
+	key, err := registry.OpenKey(registry.CLASSES_ROOT, `Directory\\shell\\pz_zip`, registry.QUERY_VALUE)
+	if err == nil {
+		key.Close()
+		fmt.Println("✓ Context menu is installed")
+
+		exePath, _ := os.Executable()
+		cmdKey, err := registry.OpenKey(registry.CLASSES_ROOT, `Directory\\shell\\pz_zip\\command`, registry.QUERY_VALUE)
+		if err == nil {
+			cmd, _, _ := cmdKey.GetStringValue("")
+			cmdKey.Close()
+			fmt.Printf("  Executable: %s\n", exePath)
+			fmt.Printf("  Command: %s\n", cmd)
+		}
+	} else {
+		fmt.Println("✗ Context menu is not installed")
+		fmt.Println("  Run: pz --context install")
+	}
+}
+
+// isAdmin checks if the current process has administrator privileges
+func isAdmin() bool {
+	_, err := os.Open("\\\\.\\PHYSICALDRIVE0")
+	return err == nil
+}
+
+// runAsAdmin restarts the program with administrator privileges
+func runAsAdmin(args ...string) error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	verb := "runas"
+	cmd := exec.Command("powershell", "-Command", "Start-Process", "-Verb", verb, "-FilePath", exePath, "-ArgumentList", strings.Join(args, ","), "-Wait")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to elevate privileges: %w", err)
+	}
+
+	os.Exit(0)
+	return nil
 }
