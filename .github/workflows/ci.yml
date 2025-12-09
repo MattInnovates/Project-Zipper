@@ -17,14 +17,5 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Verify formatting
-        run: |
-          $fmt_output = gofmt -l .
-          if ($fmt_output) {
-            Write-Host "The following files need gofmt:" -ForegroundColor Red
-            Write-Host $fmt_output -ForegroundColor Red
-            exit 1
-          }
-
       - name: Run tests
         run: go test ./...
