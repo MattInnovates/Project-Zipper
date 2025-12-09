@@ -1,4 +1,4 @@
-module github.com/0xRepo-Source/Project-Zipper
+module github.com/MattInnovates/Project-Zipper
 
 go 1.24.0
 
