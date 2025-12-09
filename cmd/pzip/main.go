@@ -83,7 +83,7 @@ func doCreate(args []string, format string) {
 		if err != nil {
 			exitWithError(err)
 		}
-		stats, err = zipper.GzipWithProgress(absTarget, archivePath, printer.OnProgress)
+		stats, err = zipper.GzipWithProgressAndFile(absTarget, archivePath, printer.OnProgressWithFile)
 		if err != nil {
 			exitWithError(err)
 		}
@@ -92,7 +92,7 @@ func doCreate(args []string, format string) {
 		if err != nil {
 			exitWithError(err)
 		}
-		stats, err = zipper.ZipWithProgress(absTarget, archivePath, printer.OnProgress)
+		stats, err = zipper.ZipWithProgressAndFile(absTarget, archivePath, printer.OnProgressWithFile)
 		if err != nil {
 			exitWithError(err)
 		}
@@ -174,11 +174,12 @@ func exitWithError(err error) {
 
 // Create mode progress printer
 type createProgressPrinter struct {
-	source    string
-	started   bool
-	startTime time.Time
-	total     int64
-	lastLen   int
+	source      string
+	started     bool
+	startTime   time.Time
+	total       int64
+	lastLen     int
+	currentFile string
 }
 
 func newCreateProgressPrinter(source string) *createProgressPrinter {
@@ -191,15 +192,20 @@ func (p *createProgressPrinter) OnProgress(done, total int64) {
 		p.startTime = time.Now()
 		p.total = total
 		numCPU := runtime.NumCPU()
-		workers := numCPU / 2
+		workers := numCPU / 5
 		if workers < 1 {
 			workers = 1
 		}
-		fmt.Fprintf(os.Stdout, "Creating archive for %s (%s) using %d/%d CPUs...\n", p.source, formatBytes(total), workers, numCPU)
+		fmt.Fprintf(os.Stdout, "[%s] Creating archive for %s (%s) using %d/%d CPUs...\n", p.startTime.Format("15:04:05"), p.source, formatBytes(total), workers, numCPU)
 	}
 
 	line := p.renderLine(done, total)
 	p.printLine(line)
+}
+
+func (p *createProgressPrinter) OnProgressWithFile(done, total int64, currentFile string) {
+	p.currentFile = currentFile
+	p.OnProgress(done, total)
 }
 
 func (p *createProgressPrinter) renderLine(done, total int64) string {
@@ -240,10 +246,27 @@ func (p *createProgressPrinter) renderLine(done, total int64) string {
 }
 
 func (p *createProgressPrinter) printLine(line string) {
-	if pad := p.lastLen - len(line); pad > 0 {
-		line += strings.Repeat(" ", pad)
+	// Move cursor up if we printed file line before
+	if p.currentFile != "" && p.lastLen > 0 {
+		fmt.Print("\033[2K\r\033[1A\033[2K\r") // Clear current line, move up, clear that line
+	} else if p.lastLen > 0 {
+		fmt.Print("\r") // Just return to start of line
 	}
-	fmt.Printf("\r%s", line)
+
+	// Print progress bar
+	fmt.Print(line)
+
+	// Print current file on same line if available
+	if p.currentFile != "" {
+		const maxFileLen = 50
+		displayFile := p.currentFile
+		if len(displayFile) > maxFileLen {
+			displayFile = "..." + displayFile[len(displayFile)-maxFileLen+3:]
+		}
+		fileLine := fmt.Sprintf("\n%s", displayFile)
+		fmt.Print(fileLine)
+	}
+
 	p.lastLen = len(line)
 }
 
@@ -259,12 +282,14 @@ func (p *createProgressPrinter) Complete(zipPath string, stats zipper.ArchiveSta
 	if err == nil {
 		zipSize = zipInfo.Size()
 	}
-	fmt.Fprintf(os.Stdout, "✓ Archive complete: %s -> %s (%s source, %s archive, %d files)\n",
+	elapsed := time.Since(p.startTime)
+	fmt.Fprintf(os.Stdout, "✓ Archive complete: %s -> %s (%s source, %s archive, %d files, %s)\n",
 		p.source,
 		zipPath,
 		formatBytes(stats.TotalBytes),
 		formatBytes(zipSize),
 		stats.FileCount,
+		formatDuration(elapsed),
 	)
 	if stats.Checksum != "" {
 		fmt.Fprintf(os.Stdout, "  SHA-256: %s\n", stats.Checksum)
@@ -294,11 +319,11 @@ func (p *extractProgressPrinter) OnProgress(done, total int64) {
 		p.startTime = time.Now()
 		p.total = total
 		numCPU := runtime.NumCPU()
-		workers := numCPU / 2
+		workers := numCPU / 5
 		if workers < 1 {
 			workers = 1
 		}
-		fmt.Fprintf(os.Stdout, "Extracting %s (%s) using %d/%d CPUs...\n", filepath.Base(p.zipPath), formatBytes(total), workers, numCPU)
+		fmt.Fprintf(os.Stdout, "[%s] Extracting %s (%s) using %d/%d CPUs...\n", p.startTime.Format("15:04:05"), filepath.Base(p.zipPath), formatBytes(total), workers, numCPU)
 	}
 
 	line := p.renderLine(done, total)
@@ -356,11 +381,13 @@ func (p *extractProgressPrinter) Complete(stats zipper.ExtractStats) {
 	}
 	fmt.Print("\n")
 	p.lastLen = 0
-	fmt.Fprintf(os.Stdout, "✓ Extraction complete: %s -> %s (%s extracted, %d files)\n",
+	elapsed := time.Since(p.startTime)
+	fmt.Fprintf(os.Stdout, "✓ Extraction complete: %s -> %s (%s extracted, %d files, %s)\n",
 		filepath.Base(p.zipPath),
 		p.destDir,
 		formatBytes(stats.TotalBytes),
 		stats.FileCount,
+		formatDuration(elapsed),
 	)
 }
 
@@ -385,6 +412,24 @@ func formatBytes(n int64) string {
 	}
 	value := float64(n) / div
 	return fmt.Sprintf("%.1f %s", value, suffixes[exp])
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	seconds := int(d.Seconds())
+	if seconds < 60 {
+		return fmt.Sprintf("%ds", seconds)
+	}
+	minutes := seconds / 60
+	seconds = seconds % 60
+	if minutes < 60 {
+		return fmt.Sprintf("%dm%ds", minutes, seconds)
+	}
+	hours := minutes / 60
+	minutes = minutes % 60
+	return fmt.Sprintf("%dh%dm", hours, minutes)
 }
 
 // handleContextMenu manages Windows context menu integration

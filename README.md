@@ -1,5 +1,7 @@
 # Project Zipper
 
+![Project Zipper](Project-Zipper.png)
+
 `pz` is a lightweight Go CLI that creates and extracts zip and gzip archives using only the Go standard library. It features automatic multi-threading (using 50% of available CPU cores) for improved performance and generates unique archive names by appending version suffixes when an archive with the base name already exists.
 
 ## Features

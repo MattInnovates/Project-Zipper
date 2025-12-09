@@ -20,6 +20,9 @@ import (
 // ProgressFunc reports the number of source bytes processed out of the total.
 type ProgressFunc func(done, total int64)
 
+// ProgressWithFileFunc reports progress including the current file being processed.
+type ProgressWithFileFunc func(done, total int64, currentFile string)
+
 // ArchiveStats describes the payload processed while creating an archive.
 type ArchiveStats struct {
 	TotalBytes int64
@@ -27,10 +30,65 @@ type ArchiveStats struct {
 	Checksum   string // SHA-256 checksum of the archive
 }
 
-// getWorkerCount returns the number of workers to use (50% of CPU cores, minimum 1)
+// shouldSkip determines if a file/directory should be excluded from archiving
+func shouldSkip(name string, isDir bool) bool {
+	lowerName := strings.ToLower(name)
+
+	// Skip hidden files/folders (starting with .)
+	if strings.HasPrefix(name, ".") {
+		return true
+	}
+
+	// Skip common development/cache directories
+	skipDirs := map[string]bool{
+		"node_modules": true,
+		"__pycache__":  true,
+		".git":         true,
+		".svn":         true,
+		".hg":          true,
+		".vscode":      true,
+		".idea":        true,
+		".vs":          true,
+		"bin":          true,
+		"obj":          true,
+		"target":       true,
+		"build":        true,
+		"dist":         true,
+		".cache":       true,
+		"temp":         true,
+		"tmp":          true,
+		".temp":        true,
+		".tmp":         true,
+		"thumbs.db":    true,
+		".ds_store":    true,
+	}
+
+	if isDir && skipDirs[lowerName] {
+		return true
+	}
+
+	// Skip temporary files
+	if strings.HasSuffix(lowerName, ".tmp") ||
+		strings.HasSuffix(lowerName, ".temp") ||
+		strings.HasSuffix(lowerName, "~") ||
+		strings.HasSuffix(lowerName, ".bak") ||
+		strings.HasSuffix(lowerName, ".swp") ||
+		strings.HasPrefix(lowerName, "~$") {
+		return true
+	}
+
+	// Skip system files
+	if lowerName == "thumbs.db" || lowerName == "desktop.ini" || lowerName == ".ds_store" {
+		return true
+	}
+
+	return false
+}
+
+// getWorkerCount returns the number of workers to use (20% of CPU cores, minimum 1)
 func getWorkerCount() int {
 	numCPU := runtime.NumCPU()
-	workers := numCPU / 2
+	workers := numCPU / 5
 	if workers < 1 {
 		workers = 1
 	}
@@ -86,6 +144,15 @@ func Zip(srcDir, zipPath string) error {
 
 // ZipWithProgress is identical to Zip but reports progress via the callback.
 func ZipWithProgress(srcDir, zipPath string, progress ProgressFunc) (stats ArchiveStats, err error) {
+	return ZipWithProgressAndFile(srcDir, zipPath, func(done, total int64, _ string) {
+		if progress != nil {
+			progress(done, total)
+		}
+	})
+}
+
+// ZipWithProgressAndFile creates a zip archive and reports progress with current file information.
+func ZipWithProgressAndFile(srcDir, zipPath string, progress ProgressWithFileFunc) (stats ArchiveStats, err error) {
 	stats, err = scanDirectory(srcDir)
 	if err != nil {
 		return stats, err
@@ -105,10 +172,15 @@ func ZipWithProgress(srcDir, zipPath string, progress ProgressFunc) (stats Archi
 
 	done := int64(0)
 	var doneMutex sync.Mutex
+	currentFile := ""
+	var currentFileMutex sync.Mutex
+
 	callProgress := func() {
 		if progress != nil {
 			doneMutex.Lock()
-			progress(done, stats.TotalBytes)
+			currentFileMutex.Lock()
+			progress(done, stats.TotalBytes, currentFile)
+			currentFileMutex.Unlock()
 			doneMutex.Unlock()
 		}
 	}
@@ -171,10 +243,15 @@ func ZipWithProgress(srcDir, zipPath string, progress ProgressFunc) (stats Archi
 				}
 
 				data, err := os.ReadFile(job.path)
+				if err != nil {
+					// Skip inaccessible files instead of failing
+					fmt.Fprintf(os.Stderr, "Warning: skipping %s: %v\n", job.path, err)
+					continue
+				}
 				dataChan <- fileData{
 					job:  job,
 					data: data,
-					err:  err,
+					err:  nil,
 				}
 			}
 		}()
@@ -197,9 +274,6 @@ func ZipWithProgress(srcDir, zipPath string, progress ProgressFunc) (stats Archi
 	// Write to zip sequentially (required by zip format)
 	processedCount := 0
 	for fd := range dataChan {
-		if fd.err != nil {
-			return stats, fd.err
-		}
 
 		header, err := zip.FileInfoHeader(fd.job.info)
 		if err != nil {
@@ -227,6 +301,10 @@ func ZipWithProgress(srcDir, zipPath string, progress ProgressFunc) (stats Archi
 			doneMutex.Lock()
 			done += int64(len(fd.data))
 			doneMutex.Unlock()
+
+			currentFileMutex.Lock()
+			currentFile = fd.job.rel
+			currentFileMutex.Unlock()
 
 			if progress != nil {
 				callProgress()
@@ -465,6 +543,15 @@ func Gzip(srcDir, gzipPath string) error {
 
 // GzipWithProgress creates a tar.gz archive and reports progress via callback
 func GzipWithProgress(srcDir, gzipPath string, progress ProgressFunc) (stats ArchiveStats, err error) {
+	return GzipWithProgressAndFile(srcDir, gzipPath, func(done, total int64, _ string) {
+		if progress != nil {
+			progress(done, total)
+		}
+	})
+}
+
+// GzipWithProgressAndFile creates a tar.gz archive and reports progress with current file information
+func GzipWithProgressAndFile(srcDir, gzipPath string, progress ProgressWithFileFunc) (stats ArchiveStats, err error) {
 	stats, err = scanDirectory(srcDir)
 	if err != nil {
 		return stats, err
@@ -486,10 +573,15 @@ func GzipWithProgress(srcDir, gzipPath string, progress ProgressFunc) (stats Arc
 
 	done := int64(0)
 	var doneMutex sync.Mutex
+	currentFile := ""
+	var currentFileMutex sync.Mutex
+
 	callProgress := func() {
 		if progress != nil {
 			doneMutex.Lock()
-			progress(done, stats.TotalBytes)
+			currentFileMutex.Lock()
+			progress(done, stats.TotalBytes, currentFile)
+			currentFileMutex.Unlock()
 			doneMutex.Unlock()
 		}
 	}
@@ -552,10 +644,15 @@ func GzipWithProgress(srcDir, gzipPath string, progress ProgressFunc) (stats Arc
 				}
 
 				data, err := os.ReadFile(job.path)
+				if err != nil {
+					// Skip inaccessible files instead of failing
+					fmt.Fprintf(os.Stderr, "Warning: skipping %s: %v\n", job.path, err)
+					continue
+				}
 				dataChan <- fileData{
 					job:  job,
 					data: data,
-					err:  err,
+					err:  nil,
 				}
 			}
 		}()
@@ -577,9 +674,6 @@ func GzipWithProgress(srcDir, gzipPath string, progress ProgressFunc) (stats Arc
 
 	// Write to tar sequentially (required by tar format)
 	for fd := range dataChan {
-		if fd.err != nil {
-			return stats, fd.err
-		}
 
 		header, err := tar.FileInfoHeader(fd.job.info, "")
 		if err != nil {
@@ -601,6 +695,10 @@ func GzipWithProgress(srcDir, gzipPath string, progress ProgressFunc) (stats Arc
 			doneMutex.Lock()
 			done += int64(len(fd.data))
 			doneMutex.Unlock()
+
+			currentFileMutex.Lock()
+			currentFile = fd.job.rel
+			currentFileMutex.Unlock()
 
 			if progress != nil {
 				callProgress()
